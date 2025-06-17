@@ -96,7 +96,53 @@ class PiBO_UCB(AnalyticAcquisitionFunction, TensorManager):
     def forward(self, X):
         mean, sigma = self._mean_and_sigma(X)
         ucb = mean + self.beta.sqrt() * sigma
+        ucb_norm = (ucb - torch.min(ucb)) / (torch.max(ucb) - torch.min(ucb))
+
         if self.pi_augment:
             prior_mean = self.prior_gp(X)
-            ucb = ucb * prior_mean.pow(self.gamma)
-        return ucb
+            prior_norm = (prior_mean - torch.min(prior_mean)) / (torch.max(prior_mean) - torch.min(prior_mean))
+            ucb_norm *= prior_norm.pow(self.gamma)
+        return ucb_norm
+
+class AlphaPiBO_UCB(AnalyticAcquisitionFunction, TensorManager):
+    '''
+    Possible issues: Because you need to normalize the ucb values and prior values, you might need 
+    to change all other acquisition function classes so that they're all min-max normalized.
+    '''
+    def __init__(
+        self,
+        model,
+        prior_pref,
+        beta,
+        alpha,
+        pi_augment=True,
+    ):
+        AnalyticAcquisitionFunction.__init__(
+            self, 
+            model=model,
+            posterior_transform=None,
+        )
+        TensorManager.__init__(self)
+        self.prior_pref = prior_pref
+        self.pi_augment = pi_augment
+        self.alpha = alpha
+        self.register_buffer("beta", self.tensor(beta))
+        self.register_buffer("alpha", self.tensor(alpha))
+        
+    def prior_gp(self, X):
+        prior_mean = self.prior_pref.pdf(X)
+        return prior_mean
+        
+    @t_batch_mode_transform(expected_q=1)
+    def forward(self, X):
+        mean, sigma = self._mean_and_sigma(X)
+        ucb = mean + self.beta.sqrt() * sigma
+        ucb_norm = (ucb - torch.min(ucb)) / (torch.max(ucb) - torch.min(ucb))
+        af_val = ucb_norm
+
+        if self.pi_augment:
+            prior_mean = self.prior_gp(X)
+            prior_norm = (prior_mean - torch.min(prior_mean)) / (torch.max(prior_mean) - torch.min(prior_mean))
+            af_val = ucb_norm * ((prior_norm*self.alpha) + (1 - self.alpha))
+
+        return af_val

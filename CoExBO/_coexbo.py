@@ -415,7 +415,6 @@ class CoExBO(HumanFeedback):
         results = [overhead, best_obs, dist, judge_correctness, y_pairwise_unsure_next.item()]
         return results, dataset_obj, dataset_duel
 
-
 class CoExBOwithSimulation:
     def __init__(
         self, 
@@ -737,3 +736,291 @@ class StateManager(TensorManager):
             gamma = self.gamma_init / (t+1)
         print(f"{t}) parameters: beta {beta:.3e} gamma {gamma:.3e}")
         return beta, gamma
+    
+class CoTrustBOwithSimulation:
+    def __init__(
+        self, 
+        domain, 
+        true_function, 
+        sigma=0,
+        training_iter=200,
+        n_mc_quadrature=100,
+        n_restarts=10,
+        raw_samples=512,
+        acqf_method="dueling",
+        probabilistic_pi=True,
+        hallucinate=True,
+        adversarial=False,
+    ):
+        """
+        CoTrustBO main instance specialised for synthetic human response.
+        The idea is to modify the CoExBO's strategy for a dynamical alpha-pi prior based on a trust score.
+        
+        Args:
+        - domain: CoExBO._prior.BasePrior, the prior distribution over the domain.
+        - true_function: class, the function that returns the true f values
+        - sigma: float, Gaussian noise variance to the synthetic human selection process.
+        - noisy: bool, whether or not the feedback contains noisy observations
+        - training_iter: int, how many iterations we run SGD for training preference GP model.
+        - n_mc_quadrature: int, how many samples we use to approximate the soft-Copeland score (human preference).
+        - n_restarts: int, number of restarts for acquisition function optimization for querying.
+        - raw_samples: int, numner of initial samples for acquisition function optimization for querying.
+        - acqf_method: string, the acquisiton function. select from ["ts", "nonmyopic", "dueling"]. "dueling" is CoExBO AF.
+        - probabilistic_pi: bool, whether or not we use the uncertainty in prior estimation. "False" is "CoExBO (piBO)".
+        - hallucinate: bool, whether or not we condition the GP on the normal BO query point.
+        - adversarial: bool, (for test). If true, our selection will be reversed.
+        """
+        self.domain = domain
+        self.true_function = true_function
+        self.duel = DuelFeedback(domain, true_function)
+        self.sigma = sigma                                # noise level of synthetic human feedback
+        self.training_iter = training_iter
+        self.n_restarts = n_restarts
+        self.raw_samples = raw_samples
+        self.n_mc_quadrature = n_mc_quadrature
+        self.learn_preference = acqf_method in ["dueling"]
+        self.probabilistic_pi = probabilistic_pi
+        self.hallucinate = hallucinate
+        self.acqf_method = acqf_method
+        self.adversarial = adversarial
+        self.alpha = 0.5
+        
+    def initial_sampling(self, n_init_obj, n_init_pref):
+        """
+        Initial sampling.
+        
+        Args:
+        - n_init_obj: int, number of intial samples for objective function.
+        - n_init_pref: int, number of intial samples for human preference.
+        
+        Return:
+        - dataset_obj: list, list of initial samples for objective function.
+        - dataset_duel: list, list of initial samples for human preference.
+        """
+        X = self.domain.sample(n_init_obj)
+        Y = self.true_function(X.squeeze())
+        dataset_obj = (X, Y)
+        self.duel.initialise_variance(dataset_obj)
+        
+        X_pairwise, y_pairwise, y_pairwise_unsure = self.duel.sample_both(n_init_pref, sigma=self.sigma, in_loop=False)
+        if self.adversarial:
+            y_pairwise = 1 - y_pairwise
+        dataset_duel = (X_pairwise, y_pairwise, y_pairwise_unsure)
+        return dataset_obj, dataset_duel
+    
+    def set_models(self, X, Y, X_pairwise, y_pairwise):
+        """
+        Set models both for objective function and human preference.
+        
+        Args:
+        - X: torch.tensor, the observed inputs
+        - Y: torch.tensor, the observed outputs
+        - X_pairwise: torch.tensor, the observed pairwise candidates
+        - y_pairwise: torch.tensor, the observed preference results
+        
+        Return:
+        - model: botorch.models.gp_regression.SingleTaskGP, BoTorch SingleTaskGP.
+        - prior_pref: CoExBO._monte_carlo_quadrature.MonteCarloQuadrature, soft-Copleland score function (human preference).
+        """
+        model = set_and_fit_rbf_model(X, Y)
+        if self.learn_preference:
+            # CoExBO acquisition function is to learn human preference.
+            model_pref = set_and_train_classifier(
+                X_pairwise, 
+                y_pairwise, 
+                training_iter=self.training_iter,
+            )
+            prior_pref = MonteCarloQuadrature(model_pref, self.domain, n_mc=self.n_mc_quadrature)
+            return model, prior_pref
+        else:
+            # The other benchmarking acquisition function is not to learn human preference.
+            return model
+    
+    def generate_pairwise_candidates(self, model, beta, prior_pref=None, gamma=None):
+        """
+        Generate a pairwise candidate for the next query.
+        
+        Args:
+        - model: botorch.models.gp_regression.SingleTaskGP, BoTorch SingleTaskGP.
+        - beta: float, optimization hyperparameter of GP-UCB, UCB := mu(x) + beta * stddev(x)
+        - prior_pref: CoExBO._monte_carlo_quadrature.MonteCarloQuadrature, soft-Copleland score function (human preference).
+        - gamma: float, decay hyperparameter in Eq.(7)
+        
+        Return:
+        - X_pairwise_next: torch.tensor, a pairwise candidate for the next query
+        - dist: float, Euclidean distance between the pairwise candidates to see how similar they are.
+        """
+        if self.learn_preference:
+            # CoExBO acquisition function is to learn human preference.
+            if self.probabilistic_pi:
+                # (Default) Includes the uncertainty on expert preference elicitation
+                acqf = DuelingAcquisitionFunction(
+                    model, 
+                    prior_pref, 
+                    beta, 
+                    gamma,
+                    method=self.acqf_method,
+                    hallucinate=self.hallucinate,
+                    n_restarts=self.n_restarts,
+                    raw_samples=self.raw_samples,
+                )
+            else:
+                # (For ablation study) does not include the uncertainty on expert preference elicitation
+                # = vanilla piBO
+                acqf = PiBODuelingAcquisitionFunction(
+                    model, 
+                    prior_pref, 
+                    beta, 
+                    gamma,
+                    method=self.acqf_method,
+                    n_restarts=self.n_restarts,
+                    raw_samples=self.raw_samples,
+                )
+        else:
+            # The other benchmarking acquisition function is not to learn human preference.
+            acqf = BaselineDuelingAcquisitionFunction(
+                model,
+                self.domain,
+                beta,
+                bounds=self.domain.bounds,
+                method=self.acqf_method,
+                n_restarts=self.n_restarts,
+                raw_samples=self.raw_samples,
+            )
+        
+        X_pairwise_next = acqf()
+        dist = (X_pairwise_next[:,0] - X_pairwise_next[:,1]).pow(2).item()
+        return X_pairwise_next, dist
+    
+    def query(self, X_pairwise_next):
+        """
+        Querying to both synthetic human response and true function.
+        
+        Args:
+        - X_pairwise_next: torch.tensor, a pairwise candidate for the next query
+        
+        Return:
+        - X_next: torch.tensor, the observed input
+        - Y_next: torch.tensor, the observed output
+        - y_pairwise_next: torch.tensor, the observed preference result (sure)
+        - y_pairwise_unsure_next: torch.tensor, the observed preference result (unsure)
+        """
+        y_pairwise_next, y_pairwise_unsure_next = self.duel.feedback(X_pairwise_next, sigma=self.sigma, in_loop=True)
+        if self.adversarial:
+            y_pairwise_next = 1 - y_pairwise_next
+        X_next = torch.chunk(X_pairwise_next, dim=1, chunks=2)[1 - y_pairwise_next]
+        Y_next = self.true_function(X_next)
+        return X_next, Y_next, y_pairwise_next, y_pairwise_unsure_next
+    
+    def update_datasets(self, dataset_obj, dataset_duel, dataset_obj_new, dataset_duel_new):
+        """
+        Merging old and new datasets for both objective and preference data.
+        
+        Args:
+        - dataset_obj: list, list of the observed samples for objective function.
+        - dataset_duel: list, list of the observed samples for human preference.
+        - dataset_obj_new: list, list of the newly observed samples for objective function.
+        - dataset_duel_new: list, list of the newly observed samples for human preference.
+        
+        Return:
+        - dataset_obj: list, list of the merged samples for objective function.
+        - dataset_duel: list, list of the merged samples for human preference.
+        """
+        X, Y = dataset_obj
+        X_next, Y_next = dataset_obj_new
+        
+        X = torch.cat((X, X_next), dim=0)
+        Y = torch.cat((Y, Y_next), dim=0)
+        dataset_obj = (X, Y)
+        dataset_duel = self.duel.update_and_augment_data(dataset_duel, dataset_duel_new)
+        return dataset_obj, dataset_duel
+    
+    def __call__(self, dataset_obj, dataset_duel, beta, gamma, sigma=None):
+        """
+        Run TrustCoBO.
+        Flow:
+        1. Train models
+        2. Generate a pairwise candidate
+        3. Query to synthetic human response function to select the candidate.
+        4. Query to true function.
+        5. Update dataset
+        6. Update alpha (trust value of preference model)
+        7. evaluate the selection results.
+
+        #TODO: Consider returning a dataset to track the progression of which model was selected?
+        
+        Args:
+        - dataset_obj: list, list of the observed samples for objective function.
+        - dataset_duel: list, list of the observed samples for human preference.
+        - beta: float, optimization hyperparameter of GP-UCB, UCB := mu(x) + beta * stddev(x)
+        - gamma: float, decay hyperparameter in Eq.(7)
+        - sigma: float, Gaussian noise variance to the synthetic human selection process.
+        
+        Return:
+        - result: list, list of the evaluation of the acquisition process.
+        - dataset_obj: list, list of the updated samples for objective function.
+        - dataset_duel: list, list of the updated samples for human preference.
+        """
+        self.duel.initialise_variance(dataset_obj)
+        if not sigma == None:
+            self.sigma = sigma
+        X, Y = dataset_obj
+        X_pairwise, y_pairwise, y_pairwise_unsure = dataset_duel
+        tic = time.monotonic()
+        # 1. TrustCoBO loop
+        if self.learn_preference:
+            model, prior_pref = self.set_models(X, Y, X_pairwise, y_pairwise)
+            X_pairwise_next, dist = self.generate_pairwise_candidates(
+                model,  
+                beta,
+                prior_pref,
+                gamma,
+            )
+        else:
+            model = self.set_models(X, Y, X_pairwise, y_pairwise)
+            X_pairwise_next, dist = self.generate_pairwise_candidates(
+                model,
+                beta,
+            )
+            
+        X_next, Y_next, y_pairwise_next, y_pairwise_unsure_next = self.query(X_pairwise_next)
+        ### TODO: Some sort of assert statement to identify which query was selected.
+        tok = time.monotonic()
+        overhead = tok - tic
+        dataset_obj_new = (X_next, Y_next)
+        dataset_duel_new = (X_pairwise_next, y_pairwise_next, y_pairwise_unsure_next)
+        result = (overhead, dist)
+        
+        dataset_obj, dataset_duel, result = self.update_and_evaluate(result, dataset_obj, dataset_duel, dataset_obj_new, dataset_duel_new)
+        return result, dataset_obj, dataset_duel
+    
+    def update_and_evaluate(self, result, dataset_obj, dataset_duel, dataset_obj_new, dataset_duel_new):
+        """
+        Update the dataset and perform post-hoc evaluation.
+        
+        Args:
+        - result: list, list of the evaluation of the acquisition process.
+        - dataset_obj: list, list of the observed samples for objective function.
+        - dataset_duel: list, list of the observed samples for human preference.
+        - dataset_obj_new: list, list of the newly observed samples for objective function.
+        - dataset_duel_new: list, list of the newly observed samples for human preference.
+        
+        Return:
+        - dataset_obj: list, list of the updated samples for objective function.
+        - dataset_duel: list, list of the updated samples for human preference.
+        - results: list, list of the evaluation of the acquisition process.
+        """
+        dataset_obj, dataset_duel = self.update_datasets(
+            dataset_obj, dataset_duel, dataset_obj_new, dataset_duel_new,
+        )
+        X, Y = dataset_obj
+        X_pairwise, y_pairwise, y_pairwise_unsure = dataset_duel
+        overhead, dist = result
+        
+        # 2. evaluate the process
+        X, Y = dataset_obj
+        best_obs = Y.max().item()
+        correct_answer_rate = self.duel.evaluate_correct_answer_rate(X_pairwise, y_pairwise)
+        results = [overhead, best_obs, dist, correct_answer_rate]
+        return dataset_obj, dataset_duel, results
+   

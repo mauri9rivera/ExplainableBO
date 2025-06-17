@@ -29,6 +29,8 @@ def set_rbf_model(X, Y):
     likelihood = GaussianLikelihood()
     model = SingleTaskGP(X, train_Y, likelihood=likelihood, covar_module=covar_module)
     if tm.is_cuda():
+        X = X.to(tm.device)
+        Y = Y.to(tm.device)
         return model.cuda()
     else:
         return model

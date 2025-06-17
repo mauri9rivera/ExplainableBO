@@ -4,7 +4,8 @@ from gpytorch.likelihoods import DirichletClassificationLikelihood
 from gpytorch.models import ExactGP
 from gpytorch.kernels import ScaleKernel, RFFKernel, RBFKernel
 from gpytorch.means import ConstantMean
-
+from ._utils import TensorManager
+tm = TensorManager()
 
 class DirichletGPModel(ExactGP):
     def __init__(self, train_x, train_y, likelihood, num_classes, base_kernel):
@@ -80,13 +81,20 @@ def train_by_sgd(model, training_iter=10):
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(model.likelihood, model)
     train_x = mll.model.train_inputs[0]
     train_y = mll.model.train_targets
-    
+
+    if tm.is_cuda:
+        model = model.to(tm.device)
+        model.likelihood = model.likelihood.to(tm.device)
+    model.train()
+    model.likelihood.train()
     for i in range(training_iter):
         optimizer.zero_grad()
         output = model(train_x)
         loss = -mll(output, model.likelihood.transformed_targets).sum()
         loss.backward()
         optimizer.step()
+    model.eval()
+    model.likelihood.eval()
     return model
 
 def set_and_train_classifier(X_pairwise, y_pairwise, training_iter=50):
