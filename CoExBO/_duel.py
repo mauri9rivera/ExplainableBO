@@ -202,3 +202,39 @@ class DuelFeedback(TensorManager):
         n_wrong = (y_pairwise - y_true).abs().sum().item()
         n_correct = (n_total - n_wrong)
         return n_correct / n_total
+    
+    def update_trust(self, dataset_obj, history, n_init_obj=20):
+        """
+        Compute the trust score (alpha) based on current pairwise feedback and best objective value.
+
+        Args:
+        - dataset_obj: tuple, the current dataset of the form (X_pairwise, y_pairwise, y_pairwise_unsure)
+
+        Returns:
+        - alpha: float, the mean trust score between 0 and 1
+        """
+
+        epsilon = 1e-6
+        _, y_obj = dataset_obj
+        y_obj = y_obj[n_init_obj:]
+        best_y_so_far, _ = y_obj.cummax(dim=0)
+
+        shifted_best_y = torch.cat([
+        torch.tensor([-float("inf")], device=best_y_so_far.device),
+        best_y_so_far[:-1]
+        ])
+
+        # Compute r = y_pairwise[t] - best_y_so_far[t-1]
+        r = torch.tensor(history, device=shifted_best_y.device) - shifted_best_y
+
+        # Compute trust[t]
+        trust = torch.where(
+            r > 0,
+            torch.ones_like(r),
+            1 / (1 + torch.exp(-(r / (shifted_best_y.abs() + epsilon))))
+        )
+
+        # Return the mean of interv as the final alpha score
+        alpha = trust.mean().item()
+        return alpha
+

@@ -5,7 +5,7 @@ from botorch.fit import fit_gpytorch_model
 from botorch.generation import MaxPosteriorSampling
 from botorch.acquisition.analytic import UpperConfidenceBound
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from ._acquisition_function import CoExBO_UCB, PiBO_UCB, AlphaPiBO_UCB
+from ._acquisition_function import CoExBO_UCB, PiBO_UCB, AlphaPiBO_UCB, CoTrust_UCB
 
 
 class BaseDuelingAcquisitionFunction:
@@ -239,15 +239,15 @@ class PiBODuelingAcquisitionFunction(BaseDuelingAcquisitionFunction):
         else:
             raise ValueError('The method should be "dueling"')
         return X_suggest.view(1,-1)
-    
+   
 class AlphaPiBODuelingAcquisitionFunction(BaseDuelingAcquisitionFunction):
     def __init__(
         self,
         model,
         prior_pref,
         beta,
-        gamma,
-        alpha=0.5,
+        alpha,
+        method="dueling",
         n_restarts=10,
         raw_samples=512,
     ):
@@ -257,17 +257,16 @@ class AlphaPiBODuelingAcquisitionFunction(BaseDuelingAcquisitionFunction):
         Args:
         - model: botorch.models.gp_regression.SingleTaskGP, BoTorch SingleTaskGP.
         - prior_pref: CoExBO._monte_carlo_quadrature.MonteCarloQuadrature, soft-Copleland score function (human preference).
-        - beta: float, optimization hyperparameter of GP-UCB, UCB := mu(x) + beta * stddev(x)
-        - gamma: float, decay hyperparameter in Eq.(7)
+        - beta: float, optimization hyperparameter of GP-UCB, UCB := mu(x) + bWeta * stddev(x)
+        - alpha: float, Ratio of trustness of prior
         - n_restarts: int, number of restarts for acquisition function optimization for querying.
         - raw_samples: int, numner of initial samples for acquisition function optimization for querying.
         """
         BaseDuelingAcquisitionFunction.__init__(self, model, prior_pref.bounds, n_restarts, raw_samples)
         self.prior_pref = prior_pref
         self.beta = beta
-        self.gamma = gamma
-        self.alpha = alpha
-        self.method = "dueling"
+        self.gamma = alpha
+        self.method = method
     
     def dueling(self):
         """
@@ -276,13 +275,26 @@ class AlphaPiBODuelingAcquisitionFunction(BaseDuelingAcquisitionFunction):
         Return:
         - X_suggest: torch.tensor, the next pairwise query points by CoExBO acquisition function
         """
-        piucb = AlphaPiBO_UCB(self.model, self.prior_pref, self.beta, self.alpha, pi_augment=False)
+        piucb = AlphaPiBO_UCB(self.model, self.prior_pref, self.beta, self.gamma, pi_augment=False)
         X_ucb = self.optimize_function(piucb)
         model_fantasy = self.hallucination(X_ucb)
         piucb = CoExBO_UCB(model_fantasy, self.prior_pref, self.beta, self.gamma, pi_augment=True)
         X_pi = self.optimize_function(piucb)
         X_suggest = torch.vstack([X_pi, X_ucb])
         return X_suggest
+    
+    def alpha_pi(self):
+
+        alphapi_ucb = AlphaPiBO_UCB(self.model, self.prior_pref, self.beta, self.gamma, pi_augment=False)
+        X_ucb = self.optimize_function(alphapi_ucb)
+
+        #fantasize
+        model_fantasy = self.hallucination(X_ucb)
+        ucb_fantasize = UpperConfidenceBound(model_fantasy, self.beta)
+        X_pess = self.optimize_function(ucb_fantasize)
+        X_suggest = torch.vstack([X_ucb, X_pess])
+        return X_suggest
+
     
     def __call__(self):
         """
@@ -293,10 +305,90 @@ class AlphaPiBODuelingAcquisitionFunction(BaseDuelingAcquisitionFunction):
         """
         if self.method == "dueling":
             X_suggest = self.dueling()
+        elif self.method == "alphapi":
+            X_suggest = self.alpha_pi()
         else:
-            raise ValueError('The method should be "dueling"')
+            raise ValueError('The method should be ["dueling", "alphapi"]')
         return X_suggest.view(1,-1)
     
+class CoTrustDuelingAcquisitionFunction(BaseDuelingAcquisitionFunction):
+    def __init__(
+        self,
+        model,
+        prior_pref,
+        beta,
+        alpha,
+        method="dueling",
+        hallucinate=False,
+        n_restarts=10,
+        raw_samples=512,
+    ):
+        """
+        Class for AlphaPiBO dueling acquisition function.
+        
+        Args:
+        - model: botorch.models.gp_regression.SingleTaskGP, BoTorch SingleTaskGP.
+        - prior_pref: CoExBO._monte_carlo_quadrature.MonteCarloQuadrature, soft-Copleland score function (human preference).
+        - beta: float, optimization hyperparameter of GP-UCB, UCB := mu(x) + bWeta * stddev(x)
+        - alpha: float, Ratio of trustness of prior
+        - n_restarts: int, number of restarts for acquisition function optimization for querying.
+        - raw_samples: int, numner of initial samples for acquisition function optimization for querying.
+        """
+        BaseDuelingAcquisitionFunction.__init__(self, model, prior_pref.bounds, n_restarts, raw_samples)
+        self.prior_pref = prior_pref
+        self.beta = beta
+        self.gamma = alpha
+        self.method = method
+        self.hallucinate = hallucinate
+    
+    def dueling(self):
+        """
+        TrustcoBO acquisition function.
+        
+        Return:
+        - X_suggest: torch.tensor, the next pairwise query points by CoExBO acquisition function
+        """
+        piucb = CoTrust_UCB(self.model, self.prior_pref, self.beta, self.gamma, pi_augment=False).to(torch.double) #?#TODO: Change to CoTrustBO_UCB
+        X_ucb = self.optimize_function(piucb)
+        if self.hallucinate:
+            # if selected, we hallucinate the GP on X_bo
+            model_fantasy = self.hallucination(X_ucb)
+            piucb = CoTrust_UCB(model_fantasy, self.prior_pref, self.beta, self.gamma, pi_augment=True).to(torch.double)
+        else:
+            # otherwise not.
+            piucb.pi_augment = True
+        X_pref = self.optimize_function(piucb)
+        X_suggest = torch.vstack([X_pref, X_ucb])
+        return X_suggest
+    
+    def alpha_pi(self):
+
+        alphapi_ucb = AlphaPiBO_UCB(self.model, self.prior_pref, self.beta, self.gamma, pi_augment=False)
+        X_ucb = self.optimize_function(alphapi_ucb)
+
+        #fantasize
+        model_fantasy = self.hallucination(X_ucb)
+        ucb_fantasize = UpperConfidenceBound(model_fantasy, self.beta)
+        X_pess = self.optimize_function(ucb_fantasize)
+        X_suggest = torch.vstack([X_ucb, X_pess])
+        return X_suggest
+
+    
+    def __call__(self):
+        """
+        Generate the pairwise candidate based on the piBO acquisition function.
+        
+        Return:
+        - X_suggest: torch.tensor, the next pairwise query points
+        """
+        if self.method == "dueling":
+            X_suggest = self.dueling()
+        elif self.method == "alphapi":
+            X_suggest = self.alpha_pi()
+        else:
+            raise ValueError('The method should be ["dueling", "alphapi"]')
+        return X_suggest.view(1,-1)
+  
 class BaselineDuelingAcquisitionFunction(BaseDuelingAcquisitionFunction):
     def __init__(
         self,
@@ -368,5 +460,5 @@ class BaselineDuelingAcquisitionFunction(BaseDuelingAcquisitionFunction):
         elif self.method == "nonmyopic":
             X_suggest = self.nonmyopic()
         else:
-            raise ValueError('The method should be from ["ts", "nonmyopic"]')
+            raise ValueError('The method should be from ["ts", "nonmyopic", "alpha"]')
         return X_suggest.view(1,-1)
