@@ -548,7 +548,6 @@ class CoExBOwithSimulation:
                     prior_pref, 
                     beta, 
                     gamma,
-                    method=self.acqf_method,
                     n_restarts=self.n_restarts,
                     raw_samples=self.raw_samples,
                 )
