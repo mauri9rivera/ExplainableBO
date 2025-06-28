@@ -750,7 +750,8 @@ class AlphaPIBOwithSimulation:
         self, 
         domain, 
         true_function, 
-        sigma=0,
+        sigma=0.1,
+        alpha=0.5,
         training_iter=200,
         n_mc_quadrature=100,
         n_restarts=10,
@@ -780,7 +781,8 @@ class AlphaPIBOwithSimulation:
         self.domain = domain
         self.true_function = true_function
         self.duel = DuelFeedback(domain, true_function)
-        self.sigma = sigma                                # noise level of synthetic human feedback
+        self.sigma = sigma  # noise level of synthetic human feedback
+        self.alpha = alpha                              
         self.training_iter = training_iter
         self.n_restarts = n_restarts
         self.raw_samples = raw_samples
