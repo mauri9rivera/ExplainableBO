@@ -211,8 +211,8 @@ class DuelFeedback(TensorManager):
     
     def update_trust(self, dataset_obj, history, n_init_obj=20):
         """
-        Compute the trust score (alpha) based on current pairwise feedback and best objective value.
-
+        Compute the trust score (alpha) based on current pairwise feedback and best objective value,
+        using only the last n = len(history) queries.
         Args:
         - dataset_obj: tuple, the current dataset of the form (X_pairwise, y_pairwise, y_pairwise_unsure)
 
@@ -229,6 +229,8 @@ class DuelFeedback(TensorManager):
         torch.tensor([-float("inf")], device=best_y_so_far.device),
         best_y_so_far[:-1]
         ])
+
+        shifted_best_y = shifted_best_y[-len(history):] # Now restrict to only the last len(history) entries
 
         # Compute r = y_pairwise[t] - best_y_so_far[t-1]
         r = torch.tensor(history, device=shifted_best_y.device) - shifted_best_y

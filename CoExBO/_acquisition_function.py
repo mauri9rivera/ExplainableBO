@@ -186,6 +186,8 @@ class CoTrust_UCB(AnalyticAcquisitionFunction, TensorManager):
     def posterior_gp(self, X, likelihood_gp_mean, likelihood_gp_std):
         prior_gp_mean, prior_gp_std = self.prior_gp(X)
 
+        #TODO: Consider if taking the norm is necessary, considering the scaling factor rho implicitely calculated.
+
         # ——————————————————————————————————————————
         #  Sanitize any non-finite or out-of-range values
         # ——————————————————————————————————————————
@@ -207,6 +209,7 @@ class CoTrust_UCB(AnalyticAcquisitionFunction, TensorManager):
         #  Normalize safely (add tiny eps even if range=0)
         # ——————————————————————————————————————————
         eps = 1e-8
+        '''
         mn, mx = prior_gp_mean.min(), prior_gp_mean.max()
         prior_norm_mean = (prior_gp_mean - mn) / ((mx - mn) + eps)
 
@@ -229,21 +232,17 @@ class CoTrust_UCB(AnalyticAcquisitionFunction, TensorManager):
             ((likelihood_gp_std.max() - likelihood_gp_std.min()) + eps),
             nan=0.5
         ).clamp(0.0, 1.0)
-
+        combined_var = (self.alpha * prior_norm_std.pow(2) + (1 - self.alpha) * likf_norm_std.pow(2))
+        posterior_gp_mean = (self.alpha * prior_norm_mean + (1 - self.alpha) * likf_norm_mean)
+        '''
+        
         # ——————————————————————————————————————————
         #  Compute your combined std, but force it ≥ eps
         # ——————————————————————————————————————————
-        combined_var = (
-            self.alpha * prior_norm_std.pow(2)
-            + (1 - self.alpha) * likf_norm_std.pow(2)
-        )
+        combined_var = (self.alpha * prior_gp_std.pow(2) + (1 - self.alpha) * likelihood_gp_std.pow(2)) 
         combined_var = combined_var.clamp(min=eps)
         posterior_gp_std = combined_var.sqrt()
-
-        posterior_gp_mean = (
-            self.alpha * prior_norm_mean
-            + (1 - self.alpha) * likf_norm_mean
-        )
+        posterior_gp_mean =  (self.alpha * prior_gp_mean + (1 - self.alpha) * likelihood_gp_mean) # (self.alpha * prior_norm_mean + (1 - self.alpha) * likf_norm_mean)
 
         return posterior_gp_mean, posterior_gp_std
 

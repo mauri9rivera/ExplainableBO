@@ -1070,7 +1070,7 @@ class CoTrustBOwithSimulation:
         self.hallucinate = hallucinate
         self.acqf_method = acqf_method
         self.adversarial = adversarial
-        self.alpha = 0.9
+        self.alpha = 0.5
         self.history = []
         
     def initial_sampling(self, n_init_obj, n_init_pref):
@@ -1260,6 +1260,10 @@ class CoTrustBOwithSimulation:
         X_pref = torch.chunk(X_pairwise_next, dim=1, chunks=2)[0]
         score = pref_model.pdf(X_pref)
         copeland =  max(model(X).mean) /score
+
+        if len(self.history) >= 10:
+            self.history.pop(0)
+        
         self.history.append(copeland)
 
     def update_and_evaluate(self, result, dataset_obj, dataset_duel, dataset_obj_new, dataset_duel_new):
