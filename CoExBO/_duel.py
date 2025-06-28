@@ -123,6 +123,12 @@ class DuelFeedback(TensorManager):
         - y_pairwise: torch.tensor, the augmented preference result (sure)
         - y_pairwise_unsure: torch.tensor, the augmented preference result (unsure)
         """
+        # Ensure all inputs are 1D
+        if y_pairwise_unsure.dim() == 0:
+            y_pairwise_unsure = y_pairwise_unsure.unsqueeze(0)
+        if y_pairwise.dim() == 0:
+            y_pairwise = y_pairwise.unsqueeze(0)
+
         X_pairwise_swap = self.swap_columns(X_pairwise)
         X_cat = torch.vstack([X_pairwise, X_pairwise_swap])
         y_pairwise_swap = abs(y_pairwise_unsure - y_pairwise)
